@@ -5,10 +5,13 @@ Runs three stages and exits non-zero if any of them fails:
 1. code tests   -- the unit test suite (exact solver, validation, and the
                    brute-force cross-check);
 2. build checks -- every source file byte-compiles and the packages import;
-3. API smoke    -- the four required models are POSTed to a live service:
+3. API smoke    -- the required models are POSTed to a live service:
                    must-rescue, 1/3-2/3 fractions, equal-value actions
                    (lexicographic tie-break) and the zero-rescue closed
-                   loop, plus a locatable-failure case.
+                   loop, a locatable-failure case, plus the opt-in
+                   termination-delay audit (slower direct vs faster relay,
+                   infinite-loop candidate alongside a finite policy, and
+                   the unchanged response when the option is absent).
 
 The stage that checks fraction probabilities and the zero-rescue closed
 loop is the HTTP smoke stage.  The process prints a report and then exits
@@ -241,6 +244,102 @@ def stage_http_smoke():
                 and "actions" in e.get("path", "") for e in errors)
         and "certificates" not in body,
         "status=%s errors=%s" % (status, errors),
+    )
+
+    # 6. termination-delay audit: slower direct vs faster relay
+    status, body = post_audit(
+        {
+            "states": ["s", "m", "r", "l"],
+            "start": "s",
+            "terminals": {"rescued": ["r"], "lost": ["l"]},
+            "actions": {
+                "s": {
+                    "direct": {"r": "1/3", "s": "2/3"},
+                    "relay": {"m": "1"},
+                },
+                "m": {"fwd": {"r": "1"}},
+            },
+            "termination_delay_audit": True,
+        }
+    )
+    block = body.get("termination_delay_audit") or {}
+    cert = {c["state"]: c for c in body.get("certificates", [])}.get("s", {})
+    acts = {a["action"]: a for a in cert.get("actions", [])}
+    ok &= check(
+        "delay audit: exact smaller-delay relay beats slower direct",
+        status == 200
+        and body.get("max_rescue_probability") == "1"
+        and block.get("state_min_termination_delays", {}).get("s") == "2"
+        and acts.get("direct", {}).get("termination_delay") == "3"
+        and acts.get("relay", {}).get("termination_delay") == "2"
+        and acts.get("relay", {}).get("delay_selected") is True
+        and acts.get("direct", {}).get("delay_selected") is False
+        and block.get("minimum_delay_policy", {}).get("s") == "relay",
+        "delays=%s policy=%s"
+        % (block.get("state_min_termination_delays"),
+           block.get("minimum_delay_policy")),
+    )
+
+    # 7. delay audit: an optimal candidate that traps with positive
+    # probability must be marked infinite with evidence, while a finite
+    # candidate is still returned
+    status, body = post_audit(
+        {
+            "states": ["s", "k", "r", "l"],
+            "start": "s",
+            "terminals": {"rescued": ["r"], "lost": ["l"]},
+            "actions": {
+                "s": {
+                    "a_trap": {"r": "1/2", "k": "1/2"},
+                    "d_safe": {"r": "1/2", "l": "1/2"},
+                },
+                "k": {"spin": {"k": "1"}},
+            },
+            "termination_delay_audit": True,
+        }
+    )
+    block = body.get("termination_delay_audit") or {}
+    cert = {c["state"]: c for c in body.get("certificates", [])}.get("s", {})
+    acts = {a["action"]: a for a in cert.get("actions", [])}
+    trap = acts.get("a_trap", {})
+    safe = acts.get("d_safe", {})
+    evidence = trap.get("infinite_delay_evidence") or {}
+    ok &= check(
+        "delay audit: infinite loop candidate marked, finite policy kept",
+        status == 200
+        and body.get("max_rescue_probability") == "1/2"
+        and trap.get("termination_delay") == "infinity"
+        and trap.get("termination_delay_infinite") is True
+        and trap.get("optimal") is True
+        and trap.get("delay_selected") is False
+        and evidence.get("closed_class_states") == ["k"]
+        and safe.get("termination_delay") == "1"
+        and safe.get("delay_selected") is True
+        and block.get("infinite_delay_states") == ["k"]
+        and block.get("minimum_delay_policy") == {"s": "d_safe"},
+        "trap=%s safe=%s infinite=%s"
+        % (trap.get("termination_delay"),
+           safe.get("termination_delay"),
+           block.get("infinite_delay_states")),
+    )
+
+    # 8. request without the option carries no delay fields at all
+    status, body = post_audit(
+        {
+            "states": ["s0", "r", "l"],
+            "start": "s0",
+            "terminals": {"rescued": ["r"], "lost": ["l"]},
+            "actions": {"s0": {"go": {"r": "1/3", "l": "2/3"}}},
+        }
+    )
+    cert = (body.get("certificates") or [{}])[0]
+    ok &= check(
+        "delay audit is opt-in: absent request yields unchanged response",
+        status == 200
+        and "termination_delay_audit" not in body
+        and "min_termination_delay" not in cert
+        and all("termination_delay" not in a for a in cert.get("actions", [])),
+        "keys=%s" % sorted(body.keys()),
     )
     return ok
 

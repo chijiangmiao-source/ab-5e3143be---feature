@@ -116,6 +116,236 @@ class RequiredScenariosTest(unittest.TestCase):
         self.assertEqual(result["max_rescue_probability"], "1")
 
 
+def thirds_delay_model():
+    payload = thirds_model()
+    payload["termination_delay_audit"] = True
+    return payload
+
+
+class TerminationDelayTest(unittest.TestCase):
+    def test_disabled_request_has_no_delay_fields(self):
+        result = audit(thirds_model())
+        self.assertNotIn("termination_delay_audit", result)
+        for cert in result["certificates"]:
+            self.assertNotIn("min_termination_delay", cert)
+            for a in cert["actions"]:
+                self.assertNotIn("termination_delay", a)
+
+    def test_simple_one_step_delay(self):
+        result = audit(thirds_delay_model())
+        block = result["termination_delay_audit"]
+        self.assertTrue(block["enabled"])
+        self.assertEqual(
+            block["metric"],
+            "expected_number_of_link_actions_before_any_terminal")
+        self.assertEqual(block["state_min_termination_delays"], {"s0": "1"})
+        cert = result["certificates"][0]
+        self.assertEqual(cert["min_termination_delay"], "1")
+        self.assertEqual(cert["min_termination_delay_num"], 1)
+        self.assertEqual(cert["min_termination_delay_den"], 1)
+        self.assertFalse(cert["min_termination_delay_infinite"])
+        self.assertEqual(cert["canonical_delay_action"], "go")
+        action = cert["actions"][0]
+        self.assertEqual(action["termination_delay"], "1")
+        self.assertTrue(action["delay_selected"])
+
+    def test_faster_relay_beats_slow_direct(self):
+        # direct: r with 1/3, retry with 2/3 -> geometric, exact delay 3
+        # relay:  s -> m -> r, two deterministic link actions -> delay 2
+        # both rescue with probability 1; the relay must be chosen.
+        payload = {
+            "states": ["s", "m", "r", "l"],
+            "start": "s",
+            "terminals": {"rescued": ["r"], "lost": ["l"]},
+            "actions": {
+                "s": {
+                    "direct": {"r": "1/3", "s": "2/3"},
+                    "relay": {"m": "1"},
+                },
+                "m": {"fwd": {"r": "1"}},
+            },
+            "termination_delay_audit": True,
+        }
+        result = audit(payload)
+        self.assertEqual(result["max_rescue_probability"], "1")
+        delays = result["termination_delay_audit"][
+            "state_min_termination_delays"]
+        self.assertEqual(delays, {"m": "1", "s": "2"})
+        self.assertEqual(
+            result["termination_delay_audit"]["minimum_delay_policy"],
+            {"m": "fwd", "s": "relay"})
+        cert = {c["state"]: c for c in result["certificates"]}["s"]
+        by = {a["action"]: a for a in cert["actions"]}
+        self.assertEqual(by["direct"]["termination_delay"], "3")
+        self.assertFalse(by["direct"]["delay_selected"])
+        self.assertEqual(by["relay"]["termination_delay"], "2")
+        self.assertTrue(by["relay"]["delay_selected"])
+        # rescue-probability canonical policy is unchanged by the audit
+        self.assertEqual(result["canonical_policy"]["s"], "direct")
+
+    def test_faster_direct_beats_two_link_relay(self):
+        # direct: r with 2/3, retry with 1/3 -> exact delay 3/2
+        # relay:  s -> m -> r -> delay 2; the direct action wins on delay.
+        payload = {
+            "states": ["s", "m", "r", "l"],
+            "start": "s",
+            "terminals": {"rescued": ["r"], "lost": ["l"]},
+            "actions": {
+                "s": {
+                    "direct": {"r": "2/3", "s": "1/3"},
+                    "relay": {"m": "1"},
+                },
+                "m": {"fwd": {"r": "1"}},
+            },
+            "termination_delay_audit": True,
+        }
+        result = audit(payload)
+        cert = {c["state"]: c for c in result["certificates"]}["s"]
+        by = {a["action"]: a for a in cert["actions"]}
+        self.assertEqual(by["direct"]["termination_delay"], "3/2")
+        self.assertTrue(by["direct"]["delay_selected"])
+        self.assertEqual(by["relay"]["termination_delay"], "2")
+        self.assertFalse(by["relay"]["delay_selected"])
+
+    def test_infinite_loop_candidate_is_marked_and_finite_policy_returned(self):
+        # Both actions preserve the maximum rescue probability 1/2:
+        #   a_trap -> r 1/2, k 1/2 ; k spins forever (positive-prob trap)
+        #   d_safe -> r 1/2, l 1/2 (terminates after one link action)
+        payload = {
+            "states": ["s", "k", "r", "l"],
+            "start": "s",
+            "terminals": {"rescued": ["r"], "lost": ["l"]},
+            "actions": {
+                "s": {
+                    "a_trap": {"r": "1/2", "k": "1/2"},
+                    "d_safe": {"r": "1/2", "l": "1/2"},
+                },
+                "k": {"spin": {"k": "1"}},
+            },
+            "termination_delay_audit": True,
+        }
+        result = audit(payload)
+        self.assertEqual(result["max_rescue_probability"], "1/2")
+        block = result["termination_delay_audit"]
+        self.assertEqual(block["state_min_termination_delays"],
+                         {"k": "infinity", "s": "1"})
+        self.assertEqual(block["infinite_delay_states"], ["k"])
+        self.assertEqual(block["minimum_delay_policy"], {"s": "d_safe"})
+        certs = {c["state"]: c for c in result["certificates"]}
+        cert = certs["s"]
+        by = {a["action"]: a for a in cert["actions"]}
+        trap = by["a_trap"]
+        self.assertTrue(trap["optimal"])
+        self.assertEqual(trap["termination_delay"], "infinity")
+        self.assertTrue(trap["termination_delay_infinite"])
+        self.assertFalse(trap["delay_selected"])
+        self.assertEqual(trap["delay_reason"],
+                         "infinite_positive_probability_nonterminating_loop")
+        evidence = trap["infinite_delay_evidence"]
+        self.assertEqual(evidence["closed_class_states"], ["k"])
+        self.assertEqual(evidence["walk_to_closed_class"][0]["probability"],
+                         "1/2")
+        self.assertEqual(evidence["walk_to_closed_class"][0]["to"], "k")
+        self.assertEqual(
+            evidence["stationary_actions"]["k"]["support"], ["k"])
+        safe = by["d_safe"]
+        self.assertEqual(safe["termination_delay"], "1")
+        self.assertTrue(safe["delay_selected"])
+        # the trap state itself has only an infinite candidate
+        kentry = certs["k"]["actions"][0]
+        self.assertEqual(kentry["termination_delay"], "infinity")
+        self.assertIsNone(certs["k"]["canonical_delay_action"])
+
+    def test_pure_closed_loop_all_delays_infinite(self):
+        payload = {
+            "states": ["s0", "k1", "k2", "r", "l"],
+            "start": "s0",
+            "terminals": {"rescued": ["r"], "lost": ["l"]},
+            "actions": {
+                "s0": {"drift": {"k1": "1"}},
+                "k1": {"spin": {"k2": "1"}},
+                "k2": {"spin": {"k1": "1"}},
+            },
+            "termination_delay_audit": True,
+        }
+        result = audit(payload)
+        block = result["termination_delay_audit"]
+        self.assertEqual(
+            block["state_min_termination_delays"],
+            {"k1": "infinity", "k2": "infinity", "s0": "infinity"})
+        self.assertEqual(block["infinite_delay_states"],
+                         ["k1", "k2", "s0"])
+        self.assertEqual(block["minimum_delay_policy"], {})
+        for cert in result["certificates"]:
+            self.assertTrue(cert["min_termination_delay_infinite"])
+            for a in cert["actions"]:
+                self.assertEqual(a["termination_delay"], "infinity")
+                self.assertIn("closed_class_states",
+                              a["infinite_delay_evidence"])
+
+    def test_zero_value_quit_vs_spin_prefers_terminating(self):
+        payload = {
+            "states": ["z", "r", "l"],
+            "start": "z",
+            "terminals": {"rescued": ["r"], "lost": ["l"]},
+            "actions": {
+                "z": {
+                    "spin": {"z": "1"},
+                    "quit": {"l": "1"},
+                }
+            },
+            "termination_delay_audit": True,
+        }
+        result = audit(payload)
+        self.assertEqual(result["max_rescue_probability"], "0")
+        cert = result["certificates"][0]
+        self.assertEqual(cert["min_termination_delay"], "1")
+        self.assertEqual(cert["canonical_delay_action"], "quit")
+        by = {a["action"]: a for a in cert["actions"]}
+        self.assertEqual(by["quit"]["termination_delay"], "1")
+        self.assertTrue(by["quit"]["delay_selected"])
+        self.assertEqual(by["spin"]["termination_delay"], "infinity")
+
+    def test_suboptimal_action_is_excluded_from_delay_audit(self):
+        payload = {
+            "states": ["s0", "r", "l"],
+            "start": "s0",
+            "terminals": {"rescued": ["r"], "lost": ["l"]},
+            "actions": {
+                "s0": {
+                    "good": {"r": "2/3", "l": "1/3"},
+                    "bad": {"r": "1/3", "l": "2/3"},
+                }
+            },
+            "termination_delay_audit": True,
+        }
+        result = audit(payload)
+        entry = {a["action"]: a for a in result["certificates"][0]["actions"]}
+        self.assertNotIn("termination_delay", entry["bad"])
+        self.assertFalse(entry["bad"]["termination_delay_audited"])
+        self.assertEqual(
+            entry["bad"]["termination_delay_excluded_reason"],
+            "action_does_not_preserve_max_rescue_probability")
+        self.assertEqual(entry["good"]["termination_delay"], "1")
+
+    def test_boolean_option_validation(self):
+        raw = json.dumps(thirds_delay_model()).replace(
+            '"termination_delay_audit": true',
+            '"termination_delay_audit": "yes"')
+        with self.assertRaises(mdp.AuditError) as ctx:
+            mdp.load_and_validate(raw)
+        err = [e for e in ctx.exception.errors
+               if e["code"] == "INVALID_TYPE"
+               and e["path"] == "$.termination_delay_audit"]
+        self.assertEqual(len(err), 1)
+
+    def test_option_false_equals_absent(self):
+        off = dict(thirds_model(), termination_delay_audit=False)
+        self.assertEqual(
+            {k for k in audit(off)},
+            {k for k in audit(thirds_model())})
+
+
 class SolverCorrectnessTest(unittest.TestCase):
     def test_bellman_equal_but_not_optimal_is_excluded(self):
         # a2 is Bellman-equal (its expected value equals the state value)
@@ -320,6 +550,60 @@ def _policy_values(model, policy):
     return values
 
 
+def _policy_termination_delays(model, policy):
+    """Exact expected number of link actions before ANY terminal under a
+    fixed memoryless policy; Fraction where termination is almost sure,
+    None where a terminal-free closed class is reachable (infinite)."""
+    nonterm = [s for s in model.states
+               if s not in model.rescued and s not in model.lost]
+    terminals = model.rescued | model.lost
+    # states that can reach a terminal at all under this policy
+    can = set(terminals)
+    changed = True
+    while changed:
+        changed = False
+        for s in nonterm:
+            if s not in can and any(
+                    t in can for t in model.actions[s][policy[s]]):
+                can.add(s)
+                changed = True
+    # almost-sure core: greatest fixpoint inside `can` whose whole support
+    # stays in the core (geometric exits survive; positive-prob traps do not)
+    good = {s for s in nonterm if s in can}
+    while True:
+        nxt = {s for s in good
+               if all(t in terminals or t in good
+                      for t in model.actions[s][policy[s]])}
+        if nxt == good:
+            break
+        good = nxt
+    idx = {s: i for i, s in enumerate(sorted(good))}
+    n = len(idx)
+    mat = [[Fraction(0)] * (n + 1) for _ in range(n)]
+    for s in good:
+        i = idx[s]
+        mat[i][i] = Fraction(1)
+        mat[i][n] = Fraction(1)
+        for t, p in model.actions[s][policy[s]].items():
+            if t in idx:
+                mat[i][idx[t]] -= p
+    if n:
+        for col in range(n):
+            piv = next(r for r in range(col, n) if mat[r][col] != 0)
+            mat[col], mat[piv] = mat[piv], mat[col]
+            pv = mat[col][col]
+            mat[col] = [v / pv for v in mat[col]]
+            for r in range(n):
+                if r != col and mat[r][col] != 0:
+                    f = mat[r][col]
+                    mat[r] = [a - f * b
+                              for a, b in zip(mat[r], mat[col])]
+    out = {}
+    for s in nonterm:
+        out[s] = mat[idx[s]][n] if s in idx else None
+    return out
+
+
 def _random_model(rng):
     n_states = rng.randint(1, 3)
     ctr = ["s%d" % i for i in range(n_states)]
@@ -386,6 +670,51 @@ class CrossCheckTest(unittest.TestCase):
                     "trial %d state %s" % (trial, s),
                 )
                 self.assertEqual(result.canonical[s], min(optimal_here))
+
+    def test_delays_against_brute_force_policy_enumeration(self):
+        rng = random.Random(20260927)
+        for trial in range(80):
+            payload = _random_model(rng)
+            payload["termination_delay_audit"] = True
+            model = build(payload)
+            result = mdp.solve(model)
+            self.assertIsNotNone(result.delay)
+            terminals = model.rescued | model.lost
+            nonterm = [s for s in model.states if s not in terminals]
+            act_lists = [sorted(model.actions[s]) for s in nonterm]
+            policies = [{}]
+            for s, acts in zip(nonterm, act_lists):
+                policies = [dict(p, **{s: a}) for p in policies
+                            for a in acts]
+            best_vals = {s: result.values[s] for s in nonterm}
+            delays_by_action = {s: {} for s in nonterm}
+            for policy in policies:
+                vals = _policy_values(model, policy)
+                if any(vals[s] != best_vals[s] for s in nonterm):
+                    continue  # does not preserve the max rescue vector
+                dh = _policy_termination_delays(model, policy)
+                for s in nonterm:
+                    cur = delays_by_action[s].get(policy[s])
+                    d = dh[s]
+                    if cur is None or (d is not None and
+                                       (cur[0] is None or d < cur[0])):
+                        delays_by_action[s][policy[s]] = (d, policy)
+            for s in nonterm:
+                got = result.delay.min_delay[s]
+                finite = [d for d, _ in delays_by_action[s].values()
+                          if d is not None]
+                want = min(finite) if finite else None
+                self.assertEqual(
+                    got, want,
+                    "trial %d state %s min delay payload %s"
+                    % (trial, s, payload))
+                for a in result.optimal_actions[s]:
+                    got_a = result.delay.action_delay[s][a]
+                    want_a = delays_by_action[s][a][0]
+                    self.assertEqual(
+                        got_a, want_a,
+                        "trial %d state %s action %s payload %s"
+                        % (trial, s, a, payload))
 
 
 if __name__ == "__main__":

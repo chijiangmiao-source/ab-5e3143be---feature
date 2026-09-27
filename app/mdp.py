@@ -94,6 +94,8 @@ class Model:
     # state -> action -> {target: Fraction}  (controllable states only,
     # zero-probability entries removed)
     actions: dict
+    # opt-in exact termination-delay audit (off unless requested)
+    termination_delay_audit: bool = False
 
 
 def load_and_validate(text):
@@ -324,6 +326,16 @@ def _validate(doc, errors):
                 % state,
             )
 
+    # ---- termination-delay audit option (opt-in) --------------------------
+    delay_audit = False
+    raw_option = root.get("termination_delay_audit")
+    if raw_option is not None:
+        if isinstance(raw_option, bool):
+            delay_audit = raw_option
+        else:
+            _err(errors, "$.termination_delay_audit", "INVALID_TYPE",
+                 "'termination_delay_audit' must be a boolean")
+
     if errors:
         return None
     return Model(
@@ -332,6 +344,7 @@ def _validate(doc, errors):
         rescued=frozenset(rescued),
         lost=frozenset(lost),
         actions=actions,
+        termination_delay_audit=delay_audit,
     )
 
 
@@ -473,6 +486,26 @@ class SolveResult:
     zero_value_states: list
     terminal_unreachable_states: list
     max_rescue_probability: Fraction
+    delay: object = None  # DelayResult when the audit is enabled
+
+
+@dataclass
+class DelayResult:
+    # controllable state -> exact minimum expected number of link actions
+    # before reaching ANY terminal, among policies keeping the maximum
+    # rescue probability (None at states where no such policy terminates
+    # almost surely)
+    min_delay: dict
+    canonical: dict  # controllable state -> delay-optimal action id
+    # controllable state -> {action: Fraction | None} exact expected
+    # termination delay under the delay-optimal continuation with that
+    # action committed; None marks a positive-probability non-terminating
+    # closed loop (infinite delay)
+    action_delay: dict
+    # controllable state -> {action: sorted list of states certifying a
+    # non-terminating closed loop reachable with positive probability}
+    infinite_evidence: dict
+    infinite_states: list  # states whose min delay is infinite
 
 
 def _expected_value(model, dist, values):
@@ -564,7 +597,7 @@ def solve(model):
     zero_value_states = sorted(s for s in nonterm if values[s] == 0)
     terminal_unreachable_states = _terminal_unreachable(model, nonterm)
 
-    return SolveResult(
+    result = SolveResult(
         values=values,
         canonical=canonical,
         optimal_actions=optimal_actions,
@@ -573,6 +606,10 @@ def solve(model):
         terminal_unreachable_states=terminal_unreachable_states,
         max_rescue_probability=values[model.start],
     )
+    if model.termination_delay_audit:
+        result.delay = _solve_delay(
+            model, nonterm, values, expected, optimal_actions)
+    return result
 
 
 def _rescued_reachable_committing(model, bellman_equal, state, action):
@@ -619,6 +656,338 @@ def _terminal_unreachable(model, nonterm):
 
 
 # ---------------------------------------------------------------------------
+# Exact minimum termination-delay audit
+#
+# The rescue-probability value vector is fixed first; only *truly optimal*
+# actions (the actions of policies attaining the maximum rescue
+# probability) are admissible here -- choosing any other would lower the
+# fixed probability.  Among those we seek the policy minimising the
+# expected number of link actions before ANY terminal (rescued or lost) is
+# hit.  Everything is exact rational arithmetic; no simulation and no
+# truncated value iteration is used.
+#
+# Winning region W (states from which an admissible policy terminates
+# almost surely): the nested attractor fixed point
+#     X_0 = every controllable state
+#     R_0 = terminals
+#     R   = existential attractor inside X (s joins once some admissible
+#           action keeps its whole support in X union terminals and moves
+#           positive probability onto R)
+#     X <- R minus terminals, repeat until stable.
+# Geometric-exit actions (e.g. s -> s with 2/3, r with 1/3) stay winning;
+# states eliminated at the end are the polytrap: every admissible
+# continuation traps them with positive probability.
+#
+# Least expected delay on W is the optimum of the exact
+# stochastic-shortest-path linear program in max form
+#     max  sum_s h(s)
+#     s.t. h(s) <= 1 + sum_t P(s,a,t) h(t)
+#          for every admissible action a whose support stays in
+#          W union terminals,   h >= 0,   h(terminal) = 0.
+# The feasible region is the set of sub-fixpoints; h = 0 is feasible and
+# its optimum is the least Bellman fixpoint, i.e. the true minimum
+# expected link-action count.  It is bounded exactly because W admits a
+# proper (almost-sure terminating) policy; candidate actions that merely
+# coordinate into loops only add redundant inequalities.  Solved exactly
+# with the same rational Bland simplex used for the rescue LP.
+#
+# Per candidate action a at state s, COMMITMENT semantics apply: s is
+# pinned to a on every revisit while every other state may re-optimise.
+# The same LP is solved on the winning region of the pinned sub-MDP; it is
+# unbounded exactly when the commitment traps with positive probability,
+# in which case the delay is infinite and a locatable positive-probability
+# walk into a bottom closed class (stationary actions never leave it, no
+# terminal reachable) is attached as evidence.
+# ---------------------------------------------------------------------------
+
+
+def _allowed(preserving, forced, x):
+    """Admissible actions at x under a commitment (the forced state may
+    use only its committed action)."""
+    if forced is not None and x == forced[0]:
+        return [forced[1]]
+    return preserving[x]
+
+
+def _winning_region(model, nonterm, terminals, preserving, forced=None):
+    """States from which almost-sure termination is forceable with
+    admissible actions (``forced`` pins one state to one action)."""
+    xset = set(nonterm)
+    while True:
+        reached = set(terminals)
+        while True:
+            added = set()
+            for s in nonterm:
+                if s not in xset or s in reached:
+                    continue
+                for a in _allowed(preserving, forced, s):
+                    dist = model.actions[s][a]
+                    if all(t in terminals or t in xset for t in dist) and \
+                            any(t in reached for t in dist):
+                        added.add(s)
+                        break
+            if not added:
+                break
+            reached |= added
+        nxt = reached - set(terminals)
+        if nxt == xset:
+            return xset
+        xset = nxt
+
+
+def _delay_lp(model, win, terminals, preserving, forced=None):
+    """Exact least expected termination delay on the winning region.
+
+    Returns {state: Fraction}, or None when no admissible policy under the
+    commitment terminates almost surely (the LP is unbounded)."""
+    states = [s for s in model.states if s in win]
+    idx = {s: i for i, s in enumerate(states)}
+    rows = []
+    for s in states:
+        for a in _allowed(preserving, forced, s):
+            dist = model.actions[s][a]
+            if all(t in terminals or t in win for t in dist):
+                rows.append((s, a))
+    n = len(states)
+    m = len(rows)
+    A = [[Fraction(0)] * n for _ in range(m)]
+    c = [Fraction(1)] * n
+    b = [Fraction(1)] * m
+    for i, (s, a) in enumerate(rows):
+        A[i][idx[s]] = Fraction(1)
+        for t, p in model.actions[s][a].items():
+            if t in idx:
+                A[i][idx[t]] -= p
+    try:
+        x, _, _ = _simplex_max(c, A, b)
+    except ArithmeticError:
+        return None  # unbounded: positive probability of never ending
+    h = {s: x[idx[s]] for s in states}
+
+    # Self-check: h is the exact least Bellman fixpoint over usable
+    # admissible actions, computed with rational arithmetic.
+    for s in states:
+        best = None
+        for a in _allowed(preserving, forced, s):
+            dist = model.actions[s][a]
+            if not all(t in terminals or t in win for t in dist):
+                continue
+            d = Fraction(1)
+            for t, p in dist.items():
+                if t in h:
+                    d += p * h[t]
+            if best is None or d < best:
+                best = d
+        if best != h[s]:
+            raise ArithmeticError(
+                "internal error: delay vector is not a fixpoint at '%s'" % s)
+    return h
+
+
+def _parent_depth(parent, entry, state):
+    d = 0
+    cur = state
+    while cur != entry:
+        if parent[cur] is None:
+            return d
+        cur = parent[cur][0]
+        d += 1
+    return d
+
+
+def _closed_class_evidence(model, nonterm, terminals, preserving, win,
+                           forced, entry):
+    """Locatable evidence of positive-probability non-termination: a
+    positive-probability admissible walk from ``entry`` into a bottom
+    closed class whose stationary admissible actions never leave it."""
+    region = {s for s in nonterm if s not in win}
+
+    # States reachable from entry without passing through a terminal.
+    reachable = {entry}
+    parent = {entry: None}
+    stack = [entry]
+    while stack:
+        x = stack.pop()
+        for a in _allowed(preserving, forced, x):
+            for t in model.actions[x][a]:
+                if t in region and t not in reachable:
+                    reachable.add(t)
+                    parent[t] = (x, a)
+                    stack.append(t)
+
+    # Greatest sub-core in which every state keeps an allowed action whose
+    # entire support stays inside the core (a closed end component).
+    core = set(reachable)
+    while True:
+        stay = {}
+        nxt = set()
+        for x in core:
+            for a in _allowed(preserving, forced, x):
+                if all(t in core for t in model.actions[x][a]):
+                    stay[x] = a
+                    nxt.add(x)
+                    break
+        if nxt == core:
+            break
+        core = nxt
+
+    # Bottom SCC of the graph induced by the staying actions: none of its
+    # stationary actions ever moves probability outside the SCC.
+    succ = {x: list(model.actions[x][stay[x]]) for x in core}
+    index = {}
+    low = {}
+    stack_t = []
+    on = set()
+    sccs = []
+    counter = [0]
+
+    def strongconnect(v):
+        index[v] = low[v] = counter[0]
+        counter[0] += 1
+        stack_t.append(v)
+        on.add(v)
+        for w in succ[v]:
+            if w not in index:
+                strongconnect(w)
+                low[v] = min(low[v], low[w])
+            elif w in on:
+                low[v] = min(low[v], index[w])
+        if low[v] == index[v]:
+            comp = set()
+            while True:
+                w = stack_t.pop()
+                on.discard(w)
+                comp.add(w)
+                if w == v:
+                    break
+            sccs.append(comp)
+
+    for v in sorted(core):
+        if v not in index:
+            strongconnect(v)
+    scc_of = {x: i for i, comp in enumerate(sccs) for x in comp}
+    bottom = [i for i, comp in enumerate(sccs)
+              if all(scc_of[w] == i for x in comp for w in succ[x])]
+    if not core or not bottom:
+        raise ArithmeticError(
+            "internal error: no closed class found in non-terminating "
+            "region from '%s'" % entry)
+    closed_states = sccs[bottom[0]]
+
+    # Walk from entry to the nearest class state via BFS parents.
+    goal = min(closed_states, key=lambda z: _parent_depth(parent, entry, z))
+    path = []
+    cur = goal
+    while cur != entry:
+        prev, a = parent[cur]
+        path.append({
+            "from": prev,
+            "action": a,
+            "to": cur,
+            "probability": _frac_str(model.actions[prev][a][cur]),
+        })
+        cur = prev
+    path.reverse()
+    return {
+        "non_terminating_region_states": sorted(region),
+        "walk_to_closed_class": path,
+        "closed_class_states": sorted(closed_states),
+        "stationary_actions": {
+            x: {
+                "action": stay[x],
+                "support": sorted(model.actions[x][stay[x]]),
+            }
+            for x in sorted(closed_states)
+        },
+        "explanation": "under the commitment every state of the non-"
+                       "terminating region keeps positive probability "
+                       "inside it; the exhibited walk reaches a bottom "
+                       "closed class with strictly positive probability, "
+                       "and the stationary action of every class state "
+                       "keeps its whole transition support inside the "
+                       "class, so no terminal is ever reached and the "
+                       "expected termination delay is infinite",
+    }
+
+
+def _committed_delay(model, nonterm, terminals, preserving, s, a):
+    """Exact expected termination delay when s is pinned to action a and
+    every other state follows the best delay-preserving continuation.
+    Returns (Fraction | None, evidence | None)."""
+    forced = (s, a)
+    win = _winning_region(model, nonterm, terminals, preserving, forced)
+    if s not in win:
+        entry = next(t for t in model.actions[s][a]
+                     if t not in terminals and t not in win)
+        evidence = _closed_class_evidence(
+            model, nonterm, terminals, preserving, win, forced, entry)
+        first = {
+            "from": s,
+            "action": a,
+            "to": entry,
+            "probability": _frac_str(model.actions[s][a][entry]),
+        }
+        evidence["walk_to_closed_class"] = [first] + evidence[
+            "walk_to_closed_class"]
+        evidence["committed_first_step"] = first
+        return None, evidence
+    h = _delay_lp(model, win, terminals, preserving, forced)
+    if h is None:
+        # s is in the existential winning region yet the LP is unbounded:
+        # defensive -- treat as non-terminating and build evidence anyway.
+        entry = next((t for t in model.actions[s][a]
+                      if t not in terminals and t not in win), None)
+        if entry is None:
+            raise ArithmeticError(
+                "internal error: delay LP unbounded at winning state '%s'"
+                % s)
+        evidence = _closed_class_evidence(
+            model, nonterm, terminals, preserving, win, forced, entry)
+        return None, evidence
+    return h[s], None
+
+
+def _solve_delay(model, nonterm, values, expected, optimal_actions):
+    terminals = set(model.rescued) | set(model.lost)
+    preserving = {s: sorted(optimal_actions[s]) for s in nonterm}
+
+    win = _winning_region(model, nonterm, terminals, preserving)
+    h_free = _delay_lp(model, win, terminals, preserving) if win else {}
+    if h_free is None:
+        raise ArithmeticError(
+            "internal error: delay LP unbounded on the almost-sure "
+            "winning core")
+
+    action_delay = {s: {} for s in nonterm}
+    evidence = {s: {} for s in nonterm}
+    min_delay = {}
+    canonical = {}
+    for s in nonterm:
+        min_delay[s] = h_free.get(s)  # None == infinite
+        canonical[s] = None
+        best_finite = None
+        for a in preserving[s]:
+            d, ev = _committed_delay(
+                model, nonterm, terminals, preserving, s, a)
+            action_delay[s][a] = d
+            if ev is not None:
+                evidence[s][a] = ev
+            elif best_finite is None or d < best_finite[1] or \
+                    (d == best_finite[1] and a < best_finite[0]):
+                best_finite = (a, d)
+        if best_finite is not None:
+            canonical[s] = best_finite[0]
+
+    return DelayResult(
+        min_delay=min_delay,
+        canonical=canonical,
+        action_delay=action_delay,
+        infinite_evidence=evidence,
+        infinite_states=sorted(s for s in nonterm if min_delay[s] is None),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Certificate rendering
 # ---------------------------------------------------------------------------
 
@@ -627,9 +996,16 @@ def _frac_str(frac):
     return str(frac) if frac.denominator != 1 else str(frac.numerator)
 
 
+def _delay_frac(d):
+    if d is None:
+        return None
+    return _frac_str(d)
+
+
 def audit(model):
     """Run the exact audit and return the JSON-serialisable certificate."""
     result = solve(model)
+    delay = result.delay
 
     certificates = []
     for s in sorted(result.canonical):
@@ -649,30 +1025,64 @@ def audit(model):
                 else:
                     reason = "equal_value_but_no_optimal_continuation"
                 is_optimal = False
-            entries.append(
-                {
-                    "action": a,
-                    "expected_value": _frac_str(ev),
-                    "expected_value_num": ev.numerator,
-                    "expected_value_den": ev.denominator,
-                    "optimal": is_optimal,
-                    "selected": a == result.canonical[s],
-                    "reason": reason,
-                }
-            )
-        certificates.append(
-            {
-                "state": s,
-                "value": _frac_str(result.values[s]),
-                "value_num": result.values[s].numerator,
-                "value_den": result.values[s].denominator,
-                "canonical_action": result.canonical[s],
-                "actions": entries,
+            entry = {
+                "action": a,
+                "expected_value": _frac_str(ev),
+                "expected_value_num": ev.numerator,
+                "expected_value_den": ev.denominator,
+                "optimal": is_optimal,
+                "selected": a == result.canonical[s],
+                "reason": reason,
             }
-        )
+            if delay is not None:
+                d = delay.action_delay[s].get(a)
+                if a not in optimal:
+                    entry["termination_delay_audited"] = False
+                    entry["termination_delay_excluded_reason"] = (
+                        "action_does_not_preserve_max_rescue_probability")
+                elif d is None:
+                    entry["termination_delay"] = "infinity"
+                    entry["termination_delay_infinite"] = True
+                    entry["delay_selected"] = False
+                    entry["delay_reason"] = (
+                        "infinite_positive_probability_nonterminating_loop")
+                    entry["infinite_delay_evidence"] = \
+                        delay.infinite_evidence[s][a]
+                else:
+                    entry["termination_delay"] = _frac_str(d)
+                    entry["termination_delay_num"] = d.numerator
+                    entry["termination_delay_den"] = d.denominator
+                    entry["termination_delay_infinite"] = False
+                    if a == delay.canonical[s]:
+                        entry["delay_selected"] = True
+                        entry["delay_reason"] = (
+                            "selected_least_expected_termination_delay")
+                    else:
+                        entry["delay_selected"] = False
+                        entry["delay_reason"] = (
+                            "higher_expected_termination_delay")
+            entries.append(entry)
+        state_cert = {
+            "state": s,
+            "value": _frac_str(result.values[s]),
+            "value_num": result.values[s].numerator,
+            "value_den": result.values[s].denominator,
+            "canonical_action": result.canonical[s],
+            "actions": entries,
+        }
+        if delay is not None:
+            md = delay.min_delay[s]
+            state_cert["min_termination_delay"] = (
+                "infinity" if md is None else _frac_str(md))
+            state_cert["min_termination_delay_infinite"] = md is None
+            if md is not None:
+                state_cert["min_termination_delay_num"] = md.numerator
+                state_cert["min_termination_delay_den"] = md.denominator
+            state_cert["canonical_delay_action"] = delay.canonical[s]
+        certificates.append(state_cert)
 
     v = result.max_rescue_probability
-    return {
+    payload = {
         "status": "ok",
         "start_state": model.start,
         "max_rescue_probability": _frac_str(v),
@@ -686,3 +1096,21 @@ def audit(model):
         "terminal_unreachable_states": result.terminal_unreachable_states,
         "certificates": certificates,
     }
+    if delay is not None:
+        payload["termination_delay_audit"] = {
+            "enabled": True,
+            "metric": "expected_number_of_link_actions_before_any_terminal",
+            "subject_to": "max_rescue_probability_preserved",
+            "state_min_termination_delays": {
+                s: ("infinity" if delay.min_delay[s] is None
+                    else _frac_str(delay.min_delay[s]))
+                for s in sorted(delay.min_delay)
+            },
+            "infinite_delay_states": delay.infinite_states,
+            "minimum_delay_policy": {
+                s: delay.canonical[s]
+                for s in sorted(delay.canonical)
+                if delay.canonical[s] is not None
+            },
+        }
+    return payload

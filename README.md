@@ -30,6 +30,65 @@ policies and no truncated value iteration is used anywhere.
   exact expected value of every action, plus the reason each action was
   selected or excluded.
 
+## Termination-delay audit (opt-in)
+
+Add `"termination_delay_audit": true` to the same request body.  Nothing
+changes unless the field is present and `true` (a non-boolean value is a
+locatable `400`); an absent or `false` request returns byte-for-byte the
+same fields as before.
+
+The audit is taken **after** the maximum rescue probability is fixed
+exactly.  Only actions of policies that attain that maximum are admissible;
+among them the service computes, again entirely in
+`fractions.Fraction`, the minimum expected number of **link actions**
+before the process reaches *any* terminal (rescued or lost):
+
+* the almost-sure-winning region is found by a nested attractor fixed
+  point — geometric exits (`s → s` with 2/3, `r` with 1/3) stay winning;
+* on that region the least expected delay is the optimum of an exact
+  stochastic-shortest-path LP in max form
+  (`max Σh s.t. h(s) ≤ 1 + ΣP(s,a,t)h(t)` for every usable admissible
+  action, `h ≥ 0`), solved with the same rational Bland simplex — no
+  simulation, no truncated iteration;
+* **commitment semantics**: each candidate action's delay is computed with
+  that state pinned to the action on every revisit and every other state
+  free to follow the delay-optimal continuation.  A slower direct action
+  loses to a faster two-link relay exactly when the fraction says so
+  (`1/3` success + retry ⇒ delay `3` vs relay delay `2`);
+* a preserving candidate that still carries **positive probability** of
+  entering a closed loop that never reaches a terminal gets delay
+  `"infinity"`, is never selected, and carries locatable evidence: the
+  positive-probability walk into a bottom closed class, the class states
+  and their stationary actions whose whole support stays trapped.  When no
+  finite candidate exists the state minimum is `"infinity"` and the state
+  is listed in `infinite_delay_states`; whenever any finite preserving
+  policy exists, the finite policy is still returned in full.
+
+The response gains one block:
+
+```json
+"termination_delay_audit": {
+  "enabled": true,
+  "metric": "expected_number_of_link_actions_before_any_terminal",
+  "subject_to": "max_rescue_probability_preserved",
+  "state_min_termination_delays": { "m": "1", "s": "2" },
+  "infinite_delay_states": [],
+  "minimum_delay_policy": { "m": "fwd", "s": "relay" }
+}
+```
+
+and every state certificate gains `min_termination_delay`
+(`"infinity"` or an exact fraction, plus `_num`/`_den`),
+`min_termination_delay_infinite` and `canonical_delay_action`.  Each
+action entry gains, for preserving actions, `termination_delay`
+(`"infinity"` or a fraction with `_num`/`_den`),
+`termination_delay_infinite`, `delay_selected`, `delay_reason` and, for
+infinite candidates, `infinite_delay_evidence`; non-preserving actions get
+`termination_delay_audited: false` with
+`termination_delay_excluded_reason`.  Per-state rescue probability, every
+candidate's expected delay and the verdict are all present so the caller
+can recompute each choice.
+
 ## API
 
 ### `POST /api/reachability-audit`
@@ -56,6 +115,10 @@ Request body:
   each action maps target states to **reduced fractions** (`"1/3"`, `"2/3"`,
   `"1"`, …; JSON floats such as `0.5` are rejected).  Each distribution must
   sum to exactly `1`.  Terminal states must not carry actions.
+* `termination_delay_audit` — *optional* boolean; when `true` the response
+  additionally carries the exact minimum termination-delay audit described
+  above.  Defaults to off and the response is unchanged when it is absent
+  or `false`.
 
 Success response (`200`):
 
@@ -136,7 +199,13 @@ The `verify` service waits for `web` to be healthy, then runs
    action and closed-loop models and asserts the exact fraction
    probabilities, the lexicographic canonical action with equal expected
    values, and the zero rescue probability of the closed loop, plus a
-   locatable `400` failure for a bad probability sum;
+   locatable `400` failure for a bad probability sum; with the
+   termination-delay option it additionally asserts the exact smaller
+   delay of the faster relay over a slower direct action, the
+   `"infinity"` marking (with evidence) of a preserving action that traps
+   with positive probability while the finite policy is still returned,
+   and that requests without the option keep their original response
+   fields;
 
 then prints a report and exits with code `0` (pass) or `1` (fail); the exit
 code is reported both as the process exit status and on the
