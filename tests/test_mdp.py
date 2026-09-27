@@ -194,6 +194,166 @@ class SolverCorrectnessTest(unittest.TestCase):
         self.assertEqual(result["max_rescue_probability"], "1")
 
 
+class TerminationLatencyTest(unittest.TestCase):
+    def relay_model(self):
+        # a_direct reaches r with probability 1 but is slow: its exact
+        # action-value is 1 + (2/3) d(s0) = 7/3 link actions; z_relay
+        # reaches r via s1 in exactly 2.  The rescue-probability canonical
+        # policy picks a_direct (lexicographic tie-break); the latency
+        # audit must pick z_relay instead.
+        return {
+            "states": ["s0", "s1", "r", "l"],
+            "start": "s0",
+            "terminals": {"rescued": ["r"], "lost": ["l"]},
+            "termination_latency_audit": True,
+            "actions": {
+                "s0": {
+                    "a_direct": {"s0": "2/3", "r": "1/3"},
+                    "z_relay": {"s1": "1"},
+                },
+                "s1": {"go": {"r": "1"}},
+            },
+        }
+
+    def loop_candidate_model(self):
+        # risky keeps the maximum rescue probability 1/2 but with
+        # probability 1/2 falls into the non-terminating k1 loop.
+        return {
+            "states": ["s0", "k1", "r", "l"],
+            "start": "s0",
+            "terminals": {"rescued": ["r"], "lost": ["l"]},
+            "termination_latency_audit": True,
+            "actions": {
+                "s0": {
+                    "risky": {"r": "1/2", "k1": "1/2"},
+                    "safe": {"r": "1/2", "l": "1/2"},
+                },
+                "k1": {"spin": {"k1": "1"}},
+            },
+        }
+
+    def test_faster_relay_beats_slower_direct(self):
+        result = audit(self.relay_model())
+        self.assertEqual(result["max_rescue_probability"], "1")
+        # stage 1 (rescue probability only) keeps the lexicographic choice
+        self.assertEqual(result["canonical_policy"], {"s0": "a_direct", "s1": "go"})
+        lat = result["termination_latency"]
+        self.assertEqual(lat["objective"], "min_expected_link_actions_to_terminal")
+        self.assertEqual(lat["start_min_latency"], "2")
+        self.assertEqual(lat["start_min_latency_num"], 2)
+        # stage 2 re-ranks by exact latency: the relay is faster
+        self.assertEqual(lat["canonical_policy"], {"s0": "z_relay", "s1": "go"})
+        self.assertEqual(lat["infinite_latency_states"], [])
+        cert = {c["state"]: c for c in lat["states"]}["s0"]
+        self.assertEqual(cert["rescue_probability"], "1")
+        self.assertEqual(cert["min_latency"], "2")
+        self.assertTrue(cert["finite"])
+        by_action = {a["action"]: a for a in cert["actions"]}
+        # exact action-value 1 + (2/3) * d(s0) = 1 + (2/3) * 2 = 7/3
+        self.assertEqual(by_action["a_direct"]["latency"], "7/3")
+        self.assertEqual(by_action["a_direct"]["latency_num"], 7)
+        self.assertEqual(by_action["a_direct"]["latency_den"], 3)
+        self.assertEqual(by_action["a_direct"]["reason"], "latency_above_minimum")
+        self.assertFalse(by_action["a_direct"]["selected"])
+        self.assertEqual(by_action["z_relay"]["latency"], "2")
+        self.assertTrue(by_action["z_relay"]["selected"])
+        self.assertEqual(
+            by_action["z_relay"]["reason"],
+            "selected_min_latency_lexicographically_least",
+        )
+
+    def test_infinite_loop_candidate_is_marked_and_finite_policy_returned(self):
+        result = audit(self.loop_candidate_model())
+        self.assertEqual(result["max_rescue_probability"], "1/2")
+        lat = result["termination_latency"]
+        self.assertEqual(lat["infinite_latency_states"], ["k1"])
+        self.assertEqual(lat["start_min_latency"], "1")
+        self.assertEqual(lat["canonical_policy"]["s0"], "safe")
+        cert = {c["state"]: c for c in lat["states"]}["s0"]
+        self.assertEqual(cert["rescue_probability"], "1/2")
+        self.assertEqual(cert["min_latency"], "1")
+        by_action = {a["action"]: a for a in cert["actions"]}
+        risky = by_action["risky"]
+        self.assertEqual(risky["latency"], "infinity")
+        self.assertFalse(risky["finite"])
+        self.assertFalse(risky["selected"])
+        self.assertEqual(risky["reason"], "infinite_latency_non_terminating_loop")
+        safe = by_action["safe"]
+        self.assertEqual(safe["latency"], "1")
+        self.assertTrue(safe["finite"])
+        self.assertTrue(safe["selected"])
+        # the doomed loop state itself is certified with infinite latency
+        k1 = {c["state"]: c for c in lat["states"]}["k1"]
+        self.assertEqual(k1["min_latency"], "infinity")
+        self.assertFalse(k1["finite"])
+        self.assertEqual(k1["canonical_action"], "spin")
+        self.assertEqual(k1["actions"][0]["latency"], "infinity")
+
+    def test_fractional_latency_is_exact(self):
+        # d0 = 1 + (2/3) d1, d1 = 1  =>  d0 = 5/3
+        result = audit(
+            {
+                "states": ["s0", "s1", "r", "l"],
+                "start": "s0",
+                "terminals": {"rescued": ["r"], "lost": ["l"]},
+                "termination_latency_audit": True,
+                "actions": {
+                    "s0": {"go": {"r": "1/3", "s1": "2/3"}},
+                    "s1": {"go": {"r": "1"}},
+                },
+            }
+        )
+        cert = {c["state"]: c for c in
+                result["termination_latency"]["states"]}["s0"]
+        self.assertEqual(cert["min_latency"], "5/3")
+        self.assertEqual(cert["min_latency_num"], 5)
+        self.assertEqual(cert["min_latency_den"], 3)
+
+    def test_equal_latency_actions_pick_lexicographically_least(self):
+        result = audit(
+            {
+                "states": ["s0", "r", "l"],
+                "start": "s0",
+                "terminals": {"rescued": ["r"], "lost": ["l"]},
+                "termination_latency_audit": True,
+                "actions": {
+                    "s0": {
+                        "zeta": {"r": "1"},
+                        "alpha": {"r": "1"},
+                    }
+                },
+            }
+        )
+        lat = result["termination_latency"]
+        self.assertEqual(lat["canonical_policy"], {"s0": "alpha"})
+        cert = lat["states"][0]
+        by_action = {a["action"]: a for a in cert["actions"]}
+        self.assertEqual(by_action["zeta"]["latency"], "1")
+        self.assertEqual(
+            by_action["zeta"]["reason"],
+            "min_latency_but_identifier_not_lexicographically_least",
+        )
+
+    def test_option_disabled_keeps_response_unchanged(self):
+        result = audit(thirds_model())
+        self.assertNotIn("termination_latency", result)
+
+    def test_option_false_keeps_response_unchanged(self):
+        payload = thirds_model()
+        payload["termination_latency_audit"] = False
+        result = audit(payload)
+        self.assertNotIn("termination_latency", result)
+
+    def test_flag_must_be_boolean(self):
+        payload = thirds_model()
+        payload["termination_latency_audit"] = "yes"
+        with self.assertRaises(mdp.AuditError) as ctx:
+            mdp.load_and_validate(json.dumps(payload))
+        err = ctx.exception.errors[0]
+        self.assertEqual(err["code"], "INVALID_TYPE")
+        self.assertEqual(err["path"], "$.termination_latency_audit")
+
+
 class ValidationTest(unittest.TestCase):
     def assert_error(self, payload, code, raw=None):
         with self.assertRaises(mdp.AuditError) as ctx:
@@ -386,6 +546,137 @@ class CrossCheckTest(unittest.TestCase):
                     "trial %d state %s" % (trial, s),
                 )
                 self.assertEqual(result.canonical[s], min(optimal_here))
+
+
+def _policy_termination_latency(model, policy):
+    """Exact expected number of link actions until a terminal is hit under
+    ``policy``; ``None`` (infinity) for states whose chain can avoid every
+    terminal forever with positive probability.  Test-only machinery."""
+    nonterm = [s for s in model.states
+               if s not in model.rescued and s not in model.lost]
+    terminals = set(model.rescued) | set(model.lost)
+    succ = {s: set(model.actions[s][policy[s]]) for s in nonterm}
+
+    # transitive closure of the chain graph
+    reach = {}
+    for s in nonterm:
+        seen = set()
+        stack = list(succ[s])
+        while stack:
+            u = stack.pop()
+            if u in seen:
+                continue
+            seen.add(u)
+            if u in succ:
+                stack.extend(succ[u])
+        reach[s] = seen
+
+    # t sits inside a terminal-free closed class iff every state reachable
+    # from t reaches t back and no terminal is reachable from t.
+    def traps(t):
+        return (
+            not (reach[t] & terminals)
+            and all(t in reach[u] for u in reach[t] if u in succ)
+        )
+
+    infinite = set()
+    for s in nonterm:
+        candidates = [s] + sorted(reach[s])
+        if any(u in succ and traps(u) for u in candidates):
+            infinite.add(s)
+
+    finite = [s for s in nonterm if s not in infinite]
+    idx = {s: i for i, s in enumerate(finite)}
+    n = len(finite)
+    # (I - Q) x = 1 via exact Gaussian elimination
+    mat = [[Fraction(0)] * (n + 1) for _ in range(n)]
+    for s in finite:
+        i = idx[s]
+        mat[i][i] = Fraction(1)
+        mat[i][n] = Fraction(1)
+        for t, p in model.actions[s][policy[s]].items():
+            if t in idx:
+                mat[i][idx[t]] -= p
+    for col in range(n):
+        piv = next(r for r in range(col, n) if mat[r][col] != 0)
+        mat[col], mat[piv] = mat[piv], mat[col]
+        pv = mat[col][col]
+        mat[col] = [v / pv for v in mat[col]]
+        for r in range(n):
+            if r != col and mat[r][col] != 0:
+                f = mat[r][col]
+                mat[r] = [a - f * b for a, b in zip(mat[r], mat[col])]
+    out = {}
+    for s in nonterm:
+        out[s] = mat[idx[s]][n] if s in idx else None
+    return out
+
+
+class LatencyCrossCheckTest(unittest.TestCase):
+    def test_against_brute_force_policy_enumeration(self):
+        rng = random.Random(20260927)
+        for trial in range(60):
+            payload = _random_model(rng)
+            model = build(payload)
+            result = mdp.solve(model)
+            lat = mdp.solve_latency(model, result)
+            nonterm = [s for s in model.states
+                       if s not in model.rescued and s not in model.lost]
+            act_lists = [result.optimal_actions[s] for s in nonterm]
+
+            # enumerate every policy over truly optimal actions
+            policies = [[]]
+            for acts in act_lists:
+                policies = [p + [a] for p in policies for a in acts]
+            evaluated = []
+            for combo in policies:
+                policy = dict(zip(nonterm, combo))
+                evaluated.append((policy,
+                                  _policy_termination_latency(model, policy)))
+            best = {s: None for s in nonterm}  # None means +infinity
+            for _, values in evaluated:
+                for s in nonterm:
+                    v = values[s]
+                    if v is not None and (best[s] is None or v < best[s]):
+                        best[s] = v
+            per_state_actions = {s: set() for s in nonterm}
+            for policy, values in evaluated:
+                for s in nonterm:
+                    if best[s] is not None and values[s] == best[s]:
+                        per_state_actions[s].add(policy[s])
+            for s in nonterm:
+                expected = best[s]
+                actual = lat.latency.get(s)
+                self.assertEqual(
+                    actual, expected,
+                    "trial %d state %s payload %s" % (trial, s, payload),
+                )
+                if expected is None:
+                    # every truly optimal action loops: canonical falls
+                    # back to the lexicographically least candidate
+                    self.assertIn(s, lat.infinite_states)
+                    self.assertEqual(
+                        lat.canonical[s], min(result.optimal_actions[s]))
+                    self.assertTrue(all(
+                        v is None
+                        for v in lat.action_latency[s].values()))
+                else:
+                    self.assertNotIn(s, lat.infinite_states)
+                    self.assertEqual(
+                        lat.canonical[s], min(per_state_actions[s]))
+                    # per-action certificate matches 1 + E[d(successor)]
+                    terminals = set(model.rescued) | set(model.lost)
+                    for a, action_lat in lat.action_latency[s].items():
+                        dist = model.actions[s][a]
+                        if all(t in terminals or t in lat.latency
+                               for t in dist):
+                            want = Fraction(1) + sum(
+                                p * lat.latency[t]
+                                for t, p in dist.items()
+                                if t not in terminals)
+                            self.assertEqual(action_lat, want)
+                        else:
+                            self.assertIsNone(action_lat)
 
 
 if __name__ == "__main__":

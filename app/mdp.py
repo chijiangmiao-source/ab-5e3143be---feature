@@ -25,6 +25,18 @@ variables are exactly the optimal primal solution v*.
 
 No floating point, no bounded random simulation, no enumeration of
 action policies and no truncated value iteration is used anywhere.
+
+When the request enables ``termination_latency_audit``, the service
+additionally computes — with the maximum rescue probability fixed — the
+exact minimum expected number of link actions until a rescued or lost
+terminal is reached, minimised only over truly optimal actions.  This is
+again an exact least fixpoint: states that cannot terminate almost
+surely are isolated by an exact max-reachability solve on the
+restricted model, and the finite minimum expected hitting times are the
+unique optimum of the LP  max sum d(s)  s.t.  d <= T(d), d >= 0.  A
+candidate action whose support can enter a non-terminating closed loop
+is certified with infinite latency, never ranked beside finite
+candidates.
 """
 
 from __future__ import annotations
@@ -94,6 +106,8 @@ class Model:
     # state -> action -> {target: Fraction}  (controllable states only,
     # zero-probability entries removed)
     actions: dict
+    # when true, also run the exact minimum-termination-latency audit
+    termination_latency: bool = False
 
 
 def load_and_validate(text):
@@ -310,6 +324,16 @@ def _validate(doc, errors):
         if parsed_actions:
             actions[state] = parsed_actions
 
+    # ---- termination latency audit option ----------------------------------
+    termination_latency = False
+    raw_option = root.get("termination_latency_audit")
+    if raw_option is not None:
+        if isinstance(raw_option, bool):
+            termination_latency = raw_option
+        else:
+            _err(errors, "$.termination_latency_audit", "INVALID_TYPE",
+                 "'termination_latency_audit' must be a boolean")
+
     # ---- every controllable state must carry actions ----------------------
     # Only report states that declared no action block at all; states whose
     # actions were declared but failed validation already carry locatable
@@ -332,6 +356,7 @@ def _validate(doc, errors):
         rescued=frozenset(rescued),
         lost=frozenset(lost),
         actions=actions,
+        termination_latency=termination_latency,
     )
 
 
@@ -619,6 +644,140 @@ def _terminal_unreachable(model, nonterm):
 
 
 # ---------------------------------------------------------------------------
+# Exact minimum termination latency (optional audit)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LatencyResult:
+    latency: dict  # safe controllable state -> Fraction (min expected steps)
+    infinite_states: list  # controllable states whose min latency is infinite
+    action_latency: dict  # controllable state -> {action: Fraction or None}
+    canonical: dict  # controllable state -> latency-canonical action id
+
+
+def solve_latency(model, result):
+    """Exact minimum expected number of link actions until a terminal
+    (rescued or lost) state is reached, minimised only over truly optimal
+    actions, i.e. those that preserve the maximum rescue probability.
+
+    A candidate action has *infinite* latency iff committing to it can,
+    with positive probability, trap the process in a non-terminating
+    closed loop.  This is decided exactly, not by simulation:
+
+    * Stage 1 computes, on the restricted model that keeps only truly
+      optimal actions, the maximum probability of reaching ANY terminal.
+      States reaching a terminal with probability 1 are "safe"; every
+      other state has infinite minimum latency (no proper policy exists).
+    * Stage 2 computes the minimum expected hitting time of the terminal
+      set on the safe states as the exact optimum of the LP
+
+          max  sum_s d(s)
+          s.t. d(s) - sum_t P(s,a,t) d(t) <= 1   for every truly optimal
+               action a whose support stays inside the safe set,
+               d(s) >= 0,
+
+      which is the least fixpoint of the Bellman minimality operator
+      d = T(d), T(d)(s) = min_a [1 + sum_t P(s,a,t) d(t)].  The LP is
+      bounded: every safe state owns a proper policy, so no nonzero
+      subharmonic direction exists.  Any feasible d satisfies d <= T(d),
+      hence d <= J* (the least fixpoint), and J* itself is feasible, so
+      the unique optimum is exactly J*.
+    """
+    nonterm = [s for s in model.states
+               if s not in model.rescued and s not in model.lost]
+    terminals = set(model.rescued) | set(model.lost)
+
+    # Stage 1: exact max reachability of the terminal set within the
+    # restricted (truly optimal actions only) model.
+    sub_actions = {
+        s: {a: model.actions[s][a] for a in result.optimal_actions[s]}
+        for s in nonterm
+    }
+    sub_model = Model(
+        states=model.states,
+        start=model.start,
+        rescued=frozenset(terminals),
+        lost=frozenset(),
+        actions=sub_actions,
+    )
+    sub_values = solve(sub_model).values
+    safe = set(s for s in nonterm if sub_values[s] == 1)
+
+    def stays_safe(dist):
+        return all(t in terminals or t in safe for t in dist)
+
+    # Stage 2: exact minimum expected hitting time on the safe states.
+    safe_states = [s for s in nonterm if s in safe]
+    latency = {}
+    if safe_states:
+        index = {s: i for i, s in enumerate(safe_states)}
+        n = len(safe_states)
+        A = []
+        for s in safe_states:
+            for a in result.optimal_actions[s]:
+                dist = model.actions[s][a]
+                if not stays_safe(dist):
+                    continue
+                row = [Fraction(0)] * n
+                row[index[s]] = Fraction(1)
+                for target, prob in dist.items():
+                    if target in index:
+                        row[index[target]] -= prob
+                A.append(row)
+        x, _, _ = _simplex_max(
+            [Fraction(1)] * n, A, [Fraction(1)] * len(A))
+        for s in safe_states:
+            latency[s] = x[index[s]]
+
+    # Per-candidate-action exact latency expectation 1 + E[d(successor)];
+    # infinite (None) when the action can move, with positive probability,
+    # into a state from which no policy terminates almost surely.
+    action_latency = {}
+    for s in nonterm:
+        entry = {}
+        for a in result.optimal_actions[s]:
+            dist = model.actions[s][a]
+            if s in safe and stays_safe(dist):
+                total = Fraction(1)
+                for target, prob in dist.items():
+                    if target not in terminals:
+                        total += prob * latency[target]
+                entry[a] = total
+            else:
+                entry[a] = None
+        action_latency[s] = entry
+
+    # Canonical action: least exact latency, ties broken by identifier.
+    # (On infinite-latency states every candidate is infinite; fall back
+    # to the lexicographically least truly optimal action.)
+    canonical = {}
+    for s in nonterm:
+        entry = action_latency[s]
+        finite = [(lat, a) for a, lat in entry.items() if lat is not None]
+        if finite:
+            best = min(lat for lat, _ in finite)
+            canonical[s] = min(a for lat, a in finite if lat == best)
+        else:
+            canonical[s] = min(entry)
+
+    # Self-check: the LP optimum reproduces the per-action minimum exactly.
+    for s in safe_states:
+        best = min(lat for lat in action_latency[s].values()
+                   if lat is not None)
+        if best != latency[s]:
+            raise ArithmeticError(
+                "internal error: latency LP is not a fixpoint at '%s'" % s)
+
+    return LatencyResult(
+        latency=latency,
+        infinite_states=sorted(s for s in nonterm if s not in safe),
+        action_latency=action_latency,
+        canonical=canonical,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Certificate rendering
 # ---------------------------------------------------------------------------
 
@@ -672,7 +831,7 @@ def audit(model):
         )
 
     v = result.max_rescue_probability
-    return {
+    out = {
         "status": "ok",
         "start_state": model.start,
         "max_rescue_probability": _frac_str(v),
@@ -686,3 +845,95 @@ def audit(model):
         "terminal_unreachable_states": result.terminal_unreachable_states,
         "certificates": certificates,
     }
+    if model.termination_latency:
+        out["termination_latency"] = _latency_certificate(model, result)
+    return out
+
+
+def _latency_certificate(model, result):
+    """Render the per-state termination-latency certificate section."""
+    lat = solve_latency(model, result)
+
+    states = []
+    for s in sorted(result.canonical):
+        best = lat.latency.get(s)  # None -> infinite minimum latency
+        entries = []
+        for a in sorted(lat.action_latency[s]):
+            action_lat = lat.action_latency[s][a]
+            selected = a == lat.canonical[s]
+            if action_lat is None:
+                entries.append(
+                    {
+                        "action": a,
+                        "latency": "infinity",
+                        "finite": False,
+                        "selected": selected,
+                        "reason": (
+                            "selected_min_latency_lexicographically_least"
+                            if selected
+                            else "infinite_latency_non_terminating_loop"
+                        ),
+                    }
+                )
+            else:
+                if selected:
+                    reason = "selected_min_latency_lexicographically_least"
+                elif action_lat == best:
+                    reason = ("min_latency_but_identifier_not_"
+                              "lexicographically_least")
+                else:
+                    reason = "latency_above_minimum"
+                entries.append(
+                    {
+                        "action": a,
+                        "latency": _frac_str(action_lat),
+                        "latency_num": action_lat.numerator,
+                        "latency_den": action_lat.denominator,
+                        "finite": True,
+                        "selected": selected,
+                        "reason": reason,
+                    }
+                )
+        value = result.values[s]
+        state_entry = {
+            "state": s,
+            "rescue_probability": _frac_str(value),
+            "rescue_probability_num": value.numerator,
+            "rescue_probability_den": value.denominator,
+            "canonical_action": lat.canonical[s],
+            "actions": entries,
+        }
+        if best is None:
+            state_entry["min_latency"] = "infinity"
+            state_entry["finite"] = False
+        else:
+            state_entry["min_latency"] = _frac_str(best)
+            state_entry["min_latency_num"] = best.numerator
+            state_entry["min_latency_den"] = best.denominator
+            state_entry["finite"] = True
+        states.append(state_entry)
+
+    # Minimum termination latency of the start state (0 when already
+    # terminal, "infinity" when every maximal-rescue policy can loop).
+    if model.start in model.rescued or model.start in model.lost:
+        start_lat = Fraction(0)
+    else:
+        start_lat = lat.latency.get(model.start)
+
+    section = {
+        "objective": "min_expected_link_actions_to_terminal",
+        "start_state": model.start,
+        "canonical_policy": {s: lat.canonical[s]
+                             for s in sorted(lat.canonical)},
+        "infinite_latency_states": lat.infinite_states,
+        "states": states,
+    }
+    if start_lat is None:
+        section["start_min_latency"] = "infinity"
+        section["start_finite"] = False
+    else:
+        section["start_min_latency"] = _frac_str(start_lat)
+        section["start_min_latency_num"] = start_lat.numerator
+        section["start_min_latency_den"] = start_lat.denominator
+        section["start_finite"] = True
+    return section
